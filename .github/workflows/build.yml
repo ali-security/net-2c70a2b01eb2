@@ -1,0 +1,139 @@
+# Authored by Seal Security: golang.org/x/net has no GitHub Actions CI upstream
+# (it is tested on Go's LUCI builders with `go test ./...`). This workflow
+# produces the proxy.golang.org module zip and runs the module's test suite.
+name: build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Space-separated test names to run (empty = full suite)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # go.mod declares `go 1.24.0`; Go's builders test x/net on the two
+        # supported releases, which were 1.24 and 1.25 when v0.45.0 was tagged
+        # (1.24.7 / 1.25.1 the current patches). The http2 transport/server and
+        # quic suites are `//go:build go1.25 || goexperiment.synctest`, so they
+        # only run on the 1.25 leg.
+        go: ["1.24.7", "1.25.1"]
+    env:
+      # Dependencies are pinned exactly by go.mod/go.sum and checked against
+      # sum.golang.org, so the default module proxy resolves the release-time set.
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: src
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false
+
+      - name: Produce module zip
+        if: matrix.go == '1.24.7'
+        run: |
+          set -euo pipefail
+          # Zip a copy of the tree without this workflow so the module zip keeps
+          # the public member set (upstream ships no .github directory).
+          mkdir -p "$RUNNER_TEMP/modsrc" "$RUNNER_TEMP/zipper" "$GITHUB_WORKSPACE/build_output"
+          cp -a src/. "$RUNNER_TEMP/modsrc/"
+          rm -f "$RUNNER_TEMP/modsrc/.github/workflows/build.yml"
+          find "$RUNNER_TEMP/modsrc/.github" -depth -type d -empty -delete
+          cd "$RUNNER_TEMP/zipper"
+          cat > create_mod.go <<'EOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              if len(os.Args) != 5 {
+                  log.Fatal("usage: go run create_mod.go <module-path> <version> <source-dir> <output-zip>")
+              }
+              m := module.Version{Path: os.Args[1], Version: os.Args[2]}
+              f, err := os.Create(os.Args[4])
+              if err != nil {
+                  log.Fatal(err)
+              }
+              defer f.Close()
+              if err := zip.CreateFromDir(f, m, os.Args[3]); err != nil {
+                  log.Fatal(err)
+              }
+              log.Printf("created module zip: %s", os.Args[4])
+          }
+          EOF
+          go mod init example.com/zipper
+          go get golang.org/x/mod@v0.28.0
+          go run create_mod.go golang.org/x/net v0.45.0 "$RUNNER_TEMP/modsrc" "$GITHUB_WORKSPACE/build_output/v0.45.0.zip"
+          unzip -l "$GITHUB_WORKSPACE/build_output/v0.45.0.zip" | tail -1
+
+      - name: Build
+        working-directory: src
+        run: |
+          go version
+          go build ./...
+
+      - name: Configure network for ipv4/ipv6/icmp tests
+        run: |
+          # The ipv6 tests need a non-::1 IPv6 address on loopback (nettest's
+          # RoutedInterface ignores ::1; BSD/macOS lo0 carries fe80::1), and the
+          # non-privileged ICMP tests a ping_group_range that admits the test user.
+          # lo keeps the Linux default of no MULTICAST flag. With it switched on
+          # (and multicast routed via lo), ipv4 and ipv6
+          # TestPacketConnReadWriteMulticastUDP block in ReadFrom until the 10m
+          # test timeout: Linux will not source multicast from the host-scoped
+          # loopback addresses, so the looped packet never matches the joined
+          # group/source. Those two tests therefore take their own
+          # "no available interface" / "not available on linux" skip.
+          sudo sysctl -w net.ipv6.conf.all.disable_ipv6=0 net.ipv6.conf.default.disable_ipv6=0 net.ipv6.conf.lo.disable_ipv6=0
+          sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
+          sudo ip -6 addr add fe80::1/64 dev lo
+          ip addr show lo
+
+      - name: Test
+        working-directory: src
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          set -eo pipefail
+          # Test binaries run as root (compilation stays unprivileged) so the
+          # raw-socket tests in icmp/ipv4/ipv6 that open ip4:/ip6: sockets run
+          # instead of skipping on EPERM.
+          GOTEST=(go test -exec "sudo -E")
+          if [ -n "$TEST_FILTER" ]; then
+            "${GOTEST[@]}" -v -run "^($(echo "$TEST_FILTER" | tr ' ' '|'))$" ./... 2>&1 | tee /tmp/scoped.log
+            for t in $TEST_FILTER; do grep -qE "^=== RUN[[:space:]]+${t}(/|$)" /tmp/scoped.log || { echo "selected test $t did not run"; exit 1; }; done
+          else
+            "${GOTEST[@]}" -v ./... 2>&1 | tee /tmp/full.log
+            echo "Skipped tests and reasons (raw-socket tests: nettest.SupportsRawSocket probes socket(AF_INET[6], SOCK_RAW, 0), which Linux rejects with EPROTONOSUPPORT even for root (protocol 0 is invalid for SOCK_RAW), so tests gated on it skip on every Linux host;"
+            echo " TestPacketConnReadWriteMulticastUDP: Linux loopback has no multicast route/source address usable for the looped group traffic - enabling it makes the test hang, see the network step):"
+            awk '/^=== (RUN|CONT|NAME)/{cur=$3; next}
+                 /^[[:space:]]*--- SKIP:/{n=$3; printf "SKIP %s: %s\n", n, (n in why ? why[n] : "(no message)"); next}
+                 /^[[:space:]]*--- /{next}
+                 /^[[:space:]]+[^[:space:]]+\.go:[0-9]+: /{line=$0; sub(/^[[:space:]]+/, "", line); why[cur]=line}' /tmp/full.log
+            awk '/^[[:space:]]*--- PASS/{p++} /^[[:space:]]*--- FAIL/{f++} /^[[:space:]]*--- SKIP/{s++} END{printf "TEST SUMMARY: %d passed, %d failed, %d skipped\n", p, f, s}' /tmp/full.log
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.go == '1.24.7'
+        with:
+          name: module-zip
+          path: build_output/v0.45.0.zip
+          if-no-files-found: error
