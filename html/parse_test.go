@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/net/html/atom"
 )
@@ -542,5 +543,70 @@ func TestDepthLimit(t *testing.T) {
 				t.Errorf("unexpected success")
 			}
 		})
+	}
+}
+
+// TestNoahsArkAttributeOrder checks that the Noah's Ark clause still treats
+// formatting elements whose attributes only differ in order as identical.
+func TestNoahsArkAttributeOrder(t *testing.T) {
+	text := `<p><b x="1" y="2"><b y="2" x="1"><b x="1" y="2"><b y="2" x="1"></p>z`
+	want := `| <html>
+|   <head>
+|   <body>
+|     <p>
+|       <b>
+|         x="1"
+|         y="2"
+|         <b>
+|           x="1"
+|           y="2"
+|           <b>
+|             x="1"
+|             y="2"
+|             <b>
+|               x="1"
+|               y="2"
+|     <b>
+|       x="1"
+|       y="2"
+|       <b>
+|         x="1"
+|         y="2"
+|         <b>
+|           x="1"
+|           y="2"
+|           "z"
+`
+	if err := testParseCase(text, want, ""); err != nil {
+		t.Errorf("%q: %s", text, err)
+	}
+}
+
+// TestNoahsArkManyAttributes checks that the Noah's Ark clause does not take
+// time quadratic in the number of attributes of each formatting element
+// (CVE-2026-25680).
+func TestNoahsArkManyAttributes(t *testing.T) {
+	const (
+		numElements = 50
+		numAttrs    = 5000
+	)
+	var attrs strings.Builder
+	for i := 0; i < numAttrs-1; i++ {
+		fmt.Fprintf(&attrs, " a%d", i)
+	}
+	var b strings.Builder
+	for i := 0; i < numElements; i++ {
+		// Every element shares all but its last attribute, so each one is
+		// compared in full against all the previous ones, but no two of them
+		// are identical.
+		fmt.Fprintf(&b, "<b%s z=%d>", attrs.String(), i)
+	}
+
+	start := time.Now()
+	if _, err := Parse(strings.NewReader(b.String())); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if d := time.Since(start); d > 10*time.Second {
+		t.Errorf("parsing %d formatting elements with %d attributes each took %v", numElements, numAttrs, d)
 	}
 }
